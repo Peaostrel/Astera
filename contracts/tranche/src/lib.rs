@@ -1,4 +1,4 @@
-#![no_std]
+#`!no_std]
 
 pub mod deposit;
 pub mod errors;
@@ -10,14 +10,14 @@ pub mod state;
 pub mod withdraw;
 
 use errors::TrancheError;
-use events::{CONFIG, EVT, OPENED, PAUSED};
+use events:{CONFIG, EVT, OPENED, PAUSED};
 use state::{DataKey, TrancheAccounting, TrancheClass, TrancheConfig, TranchePool};
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env};
 
 const REENTRANCY_GUARD: u64 = 1;
 
-// TTL bumping: all of the tranche contract's state (TranchePool,
+// TWL bumping: all of the tranche contract's state (TranchePool,
 // InvestorPosition, InvoiceTrancheExposure) lives in instance() storage,
 // which is a single ledger entry shared with the contract instance itself.
 // Without extending its TTL, that entry eventually falls below the
@@ -99,7 +99,7 @@ impl TrancheContract {
         Self::bump_instance(&env);
 
         if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, TrancheError::AlreadyInitialized);
+            panic_with_error(&env, TrancheError::AlreadyInitialized);
         }
 
         Self::validate_share_tokens(&env, &senior_share_token, &junior_share_token);
@@ -111,8 +111,8 @@ impl TrancheContract {
 
         let pool = TranchePool {
             token: token.clone(),
-            senior_share_token,
-            junior_share_token,
+            senior_share_token: senior_share_token,
+            junior_share_token: junior_share_token,
             config,
             senior: TrancheAccounting::default(),
             junior: TrancheAccounting::default(),
@@ -306,7 +306,7 @@ impl TrancheContract {
 
         let stored_admin = Self::get_admin(env.clone())?;
         if admin != stored_admin {
-            panic_with_error!(&env, TrancheError::Unauthorized);
+            panic_with_error(&env, TrancheError::Unauthorized);
         }
 
         Self::validate_config(&env, &config);
@@ -325,8 +325,8 @@ impl TrancheContract {
         } else {
             TranchePool {
                 token: token.clone(),
-                senior_share_token,
-                junior_share_token,
+                senior_share_token: senior_share_token,
+                junior_share_token: junior_share_token,
                 config,
                 senior: TrancheAccounting::default(),
                 junior: TrancheAccounting::default(),
@@ -369,129 +369,4 @@ impl TrancheContract {
         (result.senior_amount, result.junior_amount)
     }
 
-    pub fn get_invoice_exposure(
-        env: Env,
-        invoice_id: u64,
-    ) -> Option<state::InvoiceTrancheExposure> {
-        funding::get_invoice_exposure(&env, invoice_id)
-    }
-
-    pub fn distribute_waterfall_repayment(
-        env: Env,
-        token: Address,
-        invoice_id: u64,
-        total_due: i128,
-        elapsed_secs: u64,
-    ) -> (i128, i128) {
-        Self::bump_instance(&env);
-        Self::require_not_paused(&env);
-        Self::require_admin_auth(&env);
-        Self::non_reentrant_start(&env);
-        let result = repayment::distribute_waterfall_repayment(
-            &env,
-            token,
-            invoice_id,
-            total_due,
-            elapsed_secs,
-        );
-        Self::non_reentrant_end(&env);
-        result
-    }
-
-    pub fn allocate_loss(env: Env, token: Address, invoice_id: u64, shortfall: i128) {
-        Self::bump_instance(&env);
-        Self::require_not_paused(&env);
-        Self::require_admin_auth(&env);
-        Self::non_reentrant_start(&env);
-        repayment::allocate_loss(&env, token, invoice_id, shortfall);
-        Self::non_reentrant_end(&env);
-    }
-
-    pub fn simulate_waterfall(
-        env: Env,
-        token: Address,
-        invoice_id: u64,
-        hypothetical_repayment: i128,
-        elapsed_secs: u64,
-    ) -> (i128, i128) {
-        let pool = Self::get_pool(env.clone(), token);
-        let exposure: state::InvoiceTrancheExposure = env
-            .storage()
-            .instance()
-            .get(&DataKey::InvoiceExposure(invoice_id))
-            .unwrap_or_else(|| panic_with_error!(&env, TrancheError::ExposureNotFound));
-
-        math::calculate_waterfall_split(
-            &env,
-            hypothetical_repayment,
-            exposure.senior_deployed,
-            pool.config.senior_target_yield_bps,
-            pool.config.junior_first_loss_bps,
-            elapsed_secs,
-        )
-    }
-
-    /// Lifetime return in basis points: (earned - losses) * 10_000 / deposited.
-    /// Not annualized — has no time component, so it is not an APY. A pool
-    /// that returned 5% over one week and one that returned 5% over three
-    /// years both report 500 here. Callers wanting an annual rate must
-    /// weight this by elapsed time themselves.
-    pub fn get_lifetime_return_bps(env: Env, token: Address, tranche: TrancheClass) -> u32 {
-        let pool = Self::get_pool(env.clone(), token);
-        let accounting = match tranche {
-            TrancheClass::Senior => pool.senior,
-            TrancheClass::Junior => pool.junior,
-        };
-
-        if accounting.deposited == 0 {
-            return 0;
-        }
-
-        let total_return = accounting.earned - accounting.losses;
-        if total_return <= 0 {
-            return 0;
-        }
-
-        // Convert to basis points (lifetime, not annualized — see get_lifetime_return_bps).
-        let return_bps = (total_return * 10_000) / accounting.deposited;
-        return_bps.min(u32::MAX as i128) as u32
-    }
-
-    pub fn pause(env: Env, admin: Address) -> Result<(), TrancheError> {
-        Self::bump_instance(&env);
-        admin.require_auth();
-
-        let stored_admin = Self::get_admin(env.clone())?;
-        if admin != stored_admin {
-            panic_with_error!(&env, TrancheError::Unauthorized);
-        }
-
-        env.storage().instance().set(&DataKey::Paused, &true);
-        env.events()
-            .publish((EVT, PAUSED), (admin, env.ledger().timestamp()));
-        Ok(())
-    }
-
-    pub fn unpause(env: Env, admin: Address) -> Result<(), TrancheError> {
-        Self::bump_instance(&env);
-        admin.require_auth();
-
-        let stored_admin = Self::get_admin(env.clone())?;
-        if admin != stored_admin {
-            panic_with_error!(&env, TrancheError::Unauthorized);
-        }
-
-        env.storage().instance().set(&DataKey::Paused, &false);
-        env.events()
-            .publish((EVT, PAUSED), (admin, env.ledger().timestamp()));
-        Ok(())
-    }
-
-    pub fn is_paused(env: Env) -> bool {
-        Self::bump_instance(&env);
-        env.storage()
-            .instance()
-            .get::<DataKey, bool>(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-}
+    pub fn get
