@@ -141,8 +141,8 @@ pub enum ActionPayload {
     SetRescreeningInterval(u64),
     SetScreenerTimelock(u64),
     // ── governance ──
-    /// (quorum_bps, pass_bps)
-    UpdateGovernanceConfig(u32, u32),
+    /// (quorum_bps, pass_bps, execution_delay_secs)
+    UpdateGovernanceConfig(u32, u32, u64),
     /// (typed category, quorum_bps)
     SetCategoryQuorum(ProposalCategory, u32),
     // ── referral ──
@@ -383,7 +383,7 @@ pub trait ComplianceContractTrait {
 
 #[contractclient(name = "GovernanceClient")]
 pub trait GovernanceContractTrait {
-    fn update_config_via_ac(env: Env, access_control: Address, quorum_bps: u32, pass_bps: u32);
+    fn update_config_via_ac(env: Env, access_control: Address, quorum_bps: u32, pass_bps: u32, execution_delay_secs: u64);
     fn set_category_quorum_via_ac(
         env: Env,
         access_control: Address,
@@ -953,11 +953,12 @@ impl AccessControlContract {
                 ComplianceClient::new(env, target)
                     .set_screener_timelock_via_ac(this_contract, secs);
             }
-            ActionPayload::UpdateGovernanceConfig(quorum_bps, pass_bps) => {
+            ActionPayload::UpdateGovernanceConfig(quorum_bps, pass_bps, execution_delay_secs) => {
                 GovernanceClient::new(env, target).update_config_via_ac(
                     this_contract,
                     quorum_bps,
                     pass_bps,
+                    execution_delay_secs,
                 );
             }
             ActionPayload::SetCategoryQuorum(category, quorum_bps) => {
@@ -1129,7 +1130,7 @@ impl AccessControlContract {
             }
             ActionPayload::SetTreasury(_)
             | ActionPayload::WithdrawRevenue(_, _)
-            | ActionPayload::UpdateGovernanceConfig(_, _)
+            | ActionPayload::UpdateGovernanceConfig(_, _, _)
             | ActionPayload::SetCategoryQuorum(_, _)
             | ActionPayload::SetReferralPaused(_)
             | ActionPayload::SetReferralPool(_)

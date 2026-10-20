@@ -459,7 +459,7 @@ export type ActionPayload =
   | { tag: 'SetRescreeningInterval'; values: [bigint] }
   | { tag: 'SetScreenerTimelock'; values: [bigint] }
   // ── governance (#1042) ──
-  | { tag: 'UpdateGovernanceConfig'; values: [number, number] }
+  | { tag: 'UpdateGovernanceConfig'; values: [number, number, number] }
   | { tag: 'SetCategoryQuorum'; values: [number, number] }
   // ── referral (#1042) ──
   | { tag: 'SetReferralPaused'; values: [boolean] }

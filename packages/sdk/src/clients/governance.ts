@@ -471,6 +471,20 @@ export class GovernanceClient extends BaseClient {
       treasury_pass_bps: Number(r.treasury_pass_bps),
       critical_pass_bps: Number(r.critical_pass_bps),
       execution_expiry_secs: Number(r.execution_expiry_secs),
+      execution_delay_secs: Number(r.execution_delay_secs),
     };
+  }
+
+  /**
+   * Set the execution delay (timelock after proposal passes)
+   */
+  async setExecutionDelay(params: {
+    executionDelaySecs: number;
+  }, caller: string, signer?: Signer): Promise<string> {
+    const args = [
+      nativeToScVal(params.executionDelaySecs, { type: 'u64' }),
+    ];
+
+    return this.buildAndSendTx(caller, 'set_execution_delay', args);
   }
 }
