@@ -135,6 +135,8 @@ pub enum MarketError {
     OrderNotOwner = 13,
     TooManyOrders = 14,
     InvalidExpiry = 15,
+    /// A reentrancy guard is already held; the entrypoint is being re-entered.
+    Reentrancy = 16,
 }
 
 #[contracttype]
@@ -275,6 +277,7 @@ pub enum DataKey {
     PoolContract,
     Initialized,
     Paused,
+    ReentrancyGuard,
 }
 
 const LISTING_DATA: Symbol = symbol_short!("lst_data");
@@ -312,6 +315,33 @@ fn require_not_paused(env: &Env) {
     {
         panic_with_error!(env, MarketError::ContractPaused);
     }
+}
+
+/// Reentrancy guard: `true` while a cross-contract settlement call is in
+/// flight. `buy_listing` and `match_order`'s `settle_fill` call into `pool`
+/// before updating their own listing/order state, so without this guard a
+/// malicious or compromised `pool` (or a callback it triggers) could re-enter
+/// `buy_listing`/`place_order` and observe stale state (e.g. the same listing
+/// still `Open`, or an order's `remaining` not yet decremented), double-spending
+/// the underlying position. Mirrors `tranche`'s `non_reentrant_start`/`end`.
+fn non_reentrant_start(env: &Env) {
+    let locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    if locked {
+        panic_with_error!(env, MarketError::Reentrancy);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &true);
+}
+
+fn non_reentrant_end(env: &Env) {
+    env.storage()
+        .instance()
+        .set(&DataKey::ReentrancyGuard, &false);
 }
 
 // #1364: keep instance storage (admin, counters, index maps) alive across
@@ -542,6 +572,7 @@ fn settle_fill(
     amount_or_bps: u64,
     price: i128,
 ) -> bool {
+    non_reentrant_start(env);
     let settlement = PoolListingSettlement {
         buyer: buyer.clone(),
         seller: seller.clone(),
@@ -562,7 +593,9 @@ fn settle_fill(
         &Symbol::new(env, "market_settle_listing"),
         args,
     );
-    matches!(result, Ok(Ok(())))
+    let settled = matches!(result, Ok(Ok(())));
+    non_reentrant_end(env);
+    settled
 }
 
 /// Bounded matching: scans the opposite side's resting orders for the same
@@ -972,6 +1005,8 @@ impl SecondaryMarket {
         buyer.require_auth();
         require_not_paused(&env);
 
+        non_reentrant_start(&env);
+
         let mut all_listings: Map<u64, Listing> = env
             .storage()
             .persistent()
@@ -1016,7 +1051,10 @@ impl SecondaryMarket {
         );
         match result {
             Ok(Ok(())) => {}
-            _ => return Err(MarketError::SettlementFailed),
+            _ => {
+                non_reentrant_end(&env);
+                return Err(MarketError::SettlementFailed);
+            }
         }
 
         listing.status = ListingStatus::Filled;
@@ -1024,6 +1062,8 @@ impl SecondaryMarket {
         env.storage().persistent().set(&LISTING_DATA, &all_listings);
         extend_listing_ttl(&env);
         bump_instance(&env);
+
+        non_reentrant_end(&env);
 
         env.events().publish(
             (EVT, symbol_short!("lst_buy")),
@@ -1095,6 +1135,8 @@ impl SecondaryMarket {
         } = request;
         owner.require_auth();
         require_not_paused(&env);
+
+        non_reentrant_start(&env);
 
         if amount_or_bps == 0 {
             return Err(MarketError::ZeroAmount);
@@ -1233,6 +1275,8 @@ impl SecondaryMarket {
         save_order(&env, &order);
         index_order_for_owner(&env, &owner, order_id);
         bump_instance(&env);
+
+        non_reentrant_end(&env);
 
         Ok(order_id)
     }
