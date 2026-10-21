@@ -985,11 +985,16 @@ impl InvoiceContract {
         if max_exposure <= 0 {
             panic_with_error!(&env, InvoiceError::InvalidConfig);
         }
+        let existing_record: Option<DebtorRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DebtorRecord(debtor_id.clone()));
+        let current_exposure = existing_record.map(|r| r.current_exposure).unwrap_or(0);
         let record = DebtorRecord {
             debtor_id: debtor_id.clone(),
             debtor_name,
             max_exposure,
-            current_exposure: 0,
+            current_exposure,
             is_active: true,
         };
         env.storage()
@@ -1451,11 +1456,16 @@ impl InvoiceContract {
         if max_exposure <= 0 {
             panic_with_error!(&env, InvoiceError::InvalidAmount);
         }
+        let existing_record: Option<DebtorRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DebtorRecord(debtor_id.clone()));
+        let current_exposure = existing_record.map(|r| r.current_exposure).unwrap_or(0);
         let record = DebtorRecord {
             debtor_id: debtor_id.clone(),
             debtor_name,
             max_exposure,
-            current_exposure: 0,
+            current_exposure,
             is_active: true,
         };
         env.storage()
