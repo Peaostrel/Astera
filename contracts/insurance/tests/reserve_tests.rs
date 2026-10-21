@@ -530,6 +530,7 @@ fn test_file_claim_accounts_for_collateral_recovery() {
             posted_at: 0,
             released_at: 0,
             seized_at: 0,
+            settled_price: 0,
         });
 
     let payout = h.client.file_claim(&1u64);
@@ -557,6 +558,7 @@ fn test_file_claim_no_shortfall_after_full_collateral_recovery() {
             posted_at: 0,
             released_at: 0,
             seized_at: 0,
+            settled_price: 0,
         });
 
     let result = h.client.try_file_claim(&1u64);

@@ -87,6 +87,7 @@ const DEFAULT_LOPSIDED_CONFIDENCE_BPS: u32 = 6_600; // two-thirds
                                                     // Number of committee re-draws allowed after the first, before a case must
                                                     // be escalated to `admin_resolve_no_quorum`.
 const DEFAULT_MAX_RETRIES: u32 = 1;
+const MAX_JUROR_IDS: u32 = 512;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -459,6 +460,9 @@ impl ArbitrationContract {
             .get(&DataKey::JurorIds)
             .unwrap_or_else(|| Vec::new(&env));
         if !ids.contains(&operator) {
+            if ids.len() >= MAX_JUROR_IDS {
+                return Err(ArbitrationError::InvalidConfig);
+            }
             ids.push_back(operator.clone());
             env.storage().instance().set(&DataKey::JurorIds, &ids);
         }

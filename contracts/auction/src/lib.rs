@@ -49,6 +49,31 @@ pub struct InvoiceBid {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct InvoiceAuction {
+    pub auction_id: u64,
+    pub invoice_id: u64,
+    pub sme: Address,
+    pub token: Address,
+    pub principal: i128,
+    pub target_discount_bps: u32,
+    pub opened_at: u64,
+    pub duration_secs: u64,
+    pub status: AuctionStatus,
+    pub winning_bid: Option<Address>,
+    pub winning_discount_bps: Option<u32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InvestorBid {
+    pub auction_id: u64,
+    pub investor: Address,
+    pub bid_amount: i128,
+    pub discount_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct Allocation {
     pub invoice_id: u64,
     pub allocated_amount: i128,
@@ -116,6 +141,11 @@ pub enum DataKey {
     // mutation is trusted/authoritative), so it's tracked entirely here
     // rather than round-tripped to pool on every check_collateral_risk call.
     AtRiskSince(u64),
+    // #1054: invoice auction support
+    NextAuctionId,
+    Auction(u64),
+    AuctionBids(u64),
+    InvestorEscrow(Address, u64),
 }
 
 // #1036: local mirrors of pool's types, decoded by field name — same
@@ -206,6 +236,16 @@ pub enum AuctionError {
     GracePeriodNotElapsed = 25,
     InvalidRiskConfig = 26,
     AmountOverflow = 27,
+    // #1054: invoice auction errors
+    AuctionNotFound = 28,
+    AuctionNotOpen = 29,
+    AuctionExpired = 30,
+    AuctionNotExpired = 31,
+    AuctionAlreadySettled = 32,
+    BidAmountTooLow = 33,
+    BidEscrowFailed = 34,
+    BidWithdrawFailed = 35,
+    UnauthorizedSettlement = 36,
 }
 
 // ── Clearing Algorithm (pure function) ────────────────────────────────────────
@@ -504,17 +544,17 @@ impl AuctionContract {
         }
         let price = Self::price_at(&sale, now)?;
 
-        let proceeds_client = token::Client::new(&env, &sale.proceeds_token);
-        proceeds_client.transfer(&taker, &sale.proceeds_recipient, &price);
-        let token_client = token::Client::new(&env, &sale.token);
-        token_client.transfer(&env.current_contract_address(), &taker, &sale.amount);
-
         sale.status = SaleStatus::Settled;
         sale.taker = Some(taker.clone());
         sale.settled_price = Some(price);
         env.storage()
             .persistent()
             .set(&DataKey::Sale(sale_id), &sale);
+
+        let proceeds_client = token::Client::new(&env, &sale.proceeds_token);
+        proceeds_client.transfer(&taker, &sale.proceeds_recipient, &price);
+        let token_client = token::Client::new(&env, &sale.token);
+        token_client.transfer(&env.current_contract_address(), &taker, &sale.amount);
 
         env.events()
             .publish((EVT, symbol_short!("sale_take")), (sale_id, taker, price));
@@ -546,13 +586,13 @@ impl AuctionContract {
             return Err(AuctionError::SaleNotExpired);
         }
 
-        let token_client = token::Client::new(&env, &sale.token);
-        token_client.transfer(&env.current_contract_address(), &sale.seller, &sale.amount);
-
         sale.status = SaleStatus::Expired;
         env.storage()
             .persistent()
             .set(&DataKey::Sale(sale_id), &sale);
+
+        let token_client = token::Client::new(&env, &sale.token);
+        token_client.transfer(&env.current_contract_address(), &sale.seller, &sale.amount);
 
         env.events()
             .publish((EVT, symbol_short!("sale_exp")), (sale_id, caller));
@@ -581,16 +621,272 @@ impl AuctionContract {
             return Err(AuctionError::Unauthorized);
         }
 
-        let token_client = token::Client::new(&env, &sale.token);
-        token_client.transfer(&env.current_contract_address(), &sale.seller, &sale.amount);
-
         sale.status = SaleStatus::Cancelled;
         env.storage()
             .persistent()
             .set(&DataKey::Sale(sale_id), &sale);
 
+        let token_client = token::Client::new(&env, &sale.token);
+        token_client.transfer(&env.current_contract_address(), &sale.seller, &sale.amount);
+
         env.events()
-            .publish((EVT, symbol_short!("sale_cancel")), (sale_id, seller));
+            .publish((EVT, symbol_short!("sale_cncl")), (sale_id, seller));
+        Ok(())
+    }
+
+    // ── #1054: invoice funding auction ───────────────────────────────────────
+
+    /// Opens a competitive auction for funding an invoice. Investors bid
+    /// with escrowed funds, and the winning bid (best discount) settles via
+    /// a trusted cross-contract call to pool.
+    pub fn open_invoice_auction(
+        env: Env,
+        caller: Address,
+        invoice_id: u64,
+        sme: Address,
+        token: Address,
+        principal: i128,
+        target_discount_bps: u32,
+        duration_secs: u64,
+    ) -> Result<u64, AuctionError> {
+        caller.require_auth();
+        if principal <= 0 || target_discount_bps > 10_000 || duration_secs == 0 {
+            return Err(AuctionError::InvalidSaleParams);
+        }
+
+        let auction_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextAuctionId)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::NextAuctionId, &(auction_id + 1));
+
+        let auction = InvoiceAuction {
+            auction_id,
+            invoice_id,
+            sme: sme.clone(),
+            token: token.clone(),
+            principal,
+            target_discount_bps,
+            opened_at: env.ledger().timestamp(),
+            duration_secs,
+            status: AuctionStatus::Open,
+            winning_bid: None,
+            winning_discount_bps: None,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Auction(auction_id), duration_secs as u32, duration_secs as u32);
+
+        env.events()
+            .publish((EVT, symbol_short!("inv_open")), (auction_id, invoice_id, sme, principal));
+        Ok(auction_id)
+    }
+
+    pub fn get_invoice_auction(env: Env, auction_id: u64) -> Option<InvoiceAuction> {
+        env.storage().persistent().get(&DataKey::Auction(auction_id))
+    }
+
+    /// Places a bid on an open invoice auction. Funds are escrowed until
+    /// settlement or withdrawal.
+    pub fn place_bid(
+        env: Env,
+        investor: Address,
+        auction_id: u64,
+        bid_amount: i128,
+        discount_bps: u32,
+    ) -> Result<(), AuctionError> {
+        investor.require_auth();
+        let auction: InvoiceAuction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .ok_or(AuctionError::AuctionNotFound)?;
+        if auction.status != AuctionStatus::Open {
+            return Err(AuctionError::AuctionNotOpen);
+        }
+        let now = env.ledger().timestamp();
+        if now > auction.opened_at.saturating_add(auction.duration_secs) {
+            return Err(AuctionError::AuctionExpired);
+        }
+        if bid_amount <= 0 || discount_bps > 10_000 {
+            return Err(AuctionError::InvalidSaleParams);
+        }
+
+        // Escrow the bid amount
+        let token_client = token::Client::new(&env, &auction.token);
+        token_client.transfer(&investor, &env.current_contract_address(), &bid_amount);
+
+        // Record the bid
+        let escrow_key = DataKey::InvestorEscrow(investor.clone(), auction_id);
+        let existing = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&escrow_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&escrow_key, &(existing + bid_amount));
+
+        // Add to auction bids list
+        let mut bids: Vec<InvestorBid> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuctionBids(auction_id))
+            .unwrap_or(Vec::new(&env));
+        bids.push_back(InvestorBid {
+            auction_id,
+            investor: investor.clone(),
+            bid_amount,
+            discount_bps,
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuctionBids(auction_id), &bids);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AuctionBids(auction_id), auction.duration_secs as u32, auction.duration_secs as u32);
+
+        env.events()
+            .publish((EVT, symbol_short!("bid")), (auction_id, investor, bid_amount, discount_bps));
+        Ok(())
+    }
+
+    /// Withdraws a non-winning bid after auction settlement or expiry.
+    pub fn withdraw_bid(
+        env: Env,
+        investor: Address,
+        auction_id: u64,
+    ) -> Result<(), AuctionError> {
+        investor.require_auth();
+        let auction: InvoiceAuction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .ok_or(AuctionError::AuctionNotFound)?;
+        if auction.status == AuctionStatus::Open {
+            return Err(AuctionError::AuctionNotOpen);
+        }
+
+        let escrow_key = DataKey::InvestorEscrow(investor.clone(), auction_id);
+        let escrowed = env
+            .storage()
+            .persistent()
+            .get::<DataKey, i128>(&escrow_key)
+            .ok_or(AuctionError::BidWithdrawFailed)?;
+        if escrowed == 0 {
+            return Err(AuctionError::BidWithdrawFailed);
+        }
+
+        // Check if this investor won
+        let is_winner = auction.winning_bid.as_ref() == Some(&investor);
+        if is_winner {
+            return Err(AuctionError::Unauthorized);
+        }
+
+        env.storage().persistent().remove(&escrow_key);
+
+        let token_client = token::Client::new(&env, &auction.token);
+        token_client.transfer(&env.current_contract_address(), &investor, &escrowed);
+
+        env.events()
+            .publish((EVT, symbol_short!("bid_wd")), (auction_id, investor, escrowed));
+        Ok(())
+    }
+
+    /// Closes an auction and settles with the winning bid (best discount).
+    /// Called by the pool contract as a trusted caller.
+    pub fn settle_invoice_auction(
+        env: Env,
+        caller: Address,
+        auction_id: u64,
+    ) -> Result<Address, AuctionError> {
+        let pool = Self::require_pool(&env)?;
+        if caller != pool {
+            return Err(AuctionError::UnauthorizedSettlement);
+        }
+
+        let mut auction: InvoiceAuction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .ok_or(AuctionError::AuctionNotFound)?;
+        if auction.status != AuctionStatus::Open {
+            return Err(AuctionError::AuctionNotOpen);
+        }
+
+        let bids: Vec<InvestorBid> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuctionBids(auction_id))
+            .unwrap_or(Vec::new(&env));
+
+        if bids.is_empty() {
+            auction.status = AuctionStatus::Cancelled;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Auction(auction_id), &auction);
+            env.events()
+                .publish((EVT, symbol_short!("inv_cncl")), auction_id);
+            return Err(AuctionError::NoBids);
+        }
+
+        // Find winning bid (best discount)
+        let mut best_idx = 0;
+        let mut best_discount = 10_001u32;
+        for i in 0..bids.len() {
+            let bid = bids.get(i).unwrap();
+            if bid.discount_bps < best_discount {
+                best_discount = bid.discount_bps;
+                best_idx = i;
+            }
+        }
+
+        let winning_bid = bids.get(best_idx).unwrap();
+        auction.winning_bid = Some(winning_bid.investor.clone());
+        auction.winning_discount_bps = Some(winning_bid.discount_bps);
+        auction.status = AuctionStatus::Settled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+
+        env.events()
+            .publish((EVT, symbol_short!("inv_stl")), (auction_id, winning_bid.investor.clone(), winning_bid.discount_bps));
+        Ok(winning_bid.investor.clone())
+    }
+
+    /// Permissionless expiry handler: if no bids after duration, mark as cancelled.
+    pub fn expire_invoice_auction(
+        env: Env,
+        caller: Address,
+        auction_id: u64,
+    ) -> Result<(), AuctionError> {
+        caller.require_auth();
+        let mut auction: InvoiceAuction = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Auction(auction_id))
+            .ok_or(AuctionError::AuctionNotFound)?;
+        if auction.status != AuctionStatus::Open {
+            return Err(AuctionError::AuctionNotOpen);
+        }
+        let now = env.ledger().timestamp();
+        if now <= auction.opened_at.saturating_add(auction.duration_secs) {
+            return Err(AuctionError::AuctionNotExpired);
+        }
+
+        auction.status = AuctionStatus::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Auction(auction_id), &auction);
+
+        env.events()
+            .publish((EVT, symbol_short!("inv_exp")), auction_id);
         Ok(())
     }
 
@@ -607,6 +903,24 @@ impl AuctionContract {
 
     pub fn get_pool_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PoolContract)
+    }
+
+    pub fn set_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), AuctionError> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AuctionError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish(
+            (EVT, symbol_short!("admin_set")),
+            (admin, new_admin),
+        );
+        Ok(())
     }
 
     fn require_pool(env: &Env) -> Result<Address, AuctionError> {

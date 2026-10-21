@@ -260,6 +260,10 @@ fn test_liquidate_collateral_after_grace_period_elapses() {
     let deposit = pool_client.get_collateral_deposit(&1u64).unwrap();
     assert!(deposit.settled);
     assert_eq!(deposit.seized_at, env.ledger().timestamp());
+
+    // #1476: Verify the collateral sale was actually created
+    let sale = auction_client.get_sale(&1u64).expect("Sale should be created");
+    assert_eq!(sale.token, usdc_id);
 }
 
 #[test]

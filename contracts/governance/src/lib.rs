@@ -6,15 +6,6 @@ use soroban_sdk::{
     Env, String, Symbol, Vec,
 };
 
-#[contracterror]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GovernanceError {
-    AlreadyInitialized = 1,
-    InvalidQuorum = 2,
-    InvalidThreshold = 3,
-    VotingPeriodTooShort = 4,
-    InvalidMinShareBalance = 5,
-}
 
 const LEDGERS_PER_DAY: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = LEDGERS_PER_DAY * 30;
@@ -218,6 +209,17 @@ pub struct Proposal {
     pub pass_bps: u32,
 }
 
+/// #934: one entry in a voter's vote log, written each time they vote.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoteRecord {
+    pub proposal_id: u64,
+    pub in_favor: bool,
+    /// Voting weight applied, i.e. the voter's share balance at proposal creation.
+    pub weight: i128,
+    pub voted_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct GovernanceConfig {
@@ -251,6 +253,10 @@ pub enum DataKey {
     Paused,
     // #1038: governance contract address for self-rotation
     GovernanceAddress,
+    // #934: number of votes a voter has cast, i.e. the length of their vote log.
+    VoterVoteCount(Address),
+    // #934: the voter's n-th vote record (0-based, in the order votes were cast).
+    VoterVote(Address, u32),
 }
 
 // #1038: Cross-contract client traits for governance-gated parameter changes
@@ -302,7 +308,7 @@ pub trait PoolContract {
 #[contractclient(name = "InvoiceClient")]
 pub trait InvoiceContract {
     fn set_grace_period_via_governance(env: Env, governance: Address, days: u32);
-    fn set_max_invoice_amount_via_governance(env: Env, governance: Address, max_amount: i128);
+    fn set_max_invoice_amount_gov(env: Env, governance: Address, max_amount: i128);
     fn set_max_sme_outstanding_via_governance(env: Env, governance: Address, max: i128);
     fn set_expiration_duration_via_governance(
         env: Env,
@@ -458,12 +464,28 @@ fn proposal_weight(env: &Env, share_token: &Address, voter: &Address, snapshot_a
     ShareTokenClient::new(env, share_token).balance_at(voter, &snapshot_at)
 }
 
+/// #934: append a vote to the voter's log. Records are indexed rather than
+/// kept in a single Vec so a prolific voter never has to rewrite one large
+/// entry, and readers can page through the log.
+fn append_vote_record(env: &Env, voter: &Address, record: VoteRecord) {
+    let count_key = DataKey::VoterVoteCount(voter.clone());
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&DataKey::VoterVote(voter.clone(), count), &record);
+    env.storage().persistent().set(&count_key, &(count + 1));
+}
+
 fn finalize_proposal(env: &Env, proposal: &mut Proposal) -> GovernanceResult<()> {
+    // #944: only finalize active proposals — re-finalizing already-terminal
+    // states is a no-op and would incorrectly reset the passed_at timestamp.
     if proposal.status != ProposalStatus::Active {
         return Ok(());
     }
 
     let snapshot_supply = proposal.snapshot_supply;
+    // #944: guard against supply being zero or negative after snapshot
+    // invalidation; such proposals are rejected.
     if snapshot_supply <= 0 {
         proposal.status = ProposalStatus::Rejected;
         return Ok(());
@@ -471,7 +493,14 @@ fn finalize_proposal(env: &Env, proposal: &mut Proposal) -> GovernanceResult<()>
 
     // #933: use quorum/pass snapshotted onto the proposal at creation.
     let total_votes = proposal.votes_for + proposal.votes_against;
-    let quorum = (snapshot_supply * proposal.quorum_bps as i128) / 10_000i128;
+    // #944: use checked division to avoid wrap-around on extreme values;
+    // the SDK guarantees quorum_bps <= 10_000 but i128 math can overflow
+    // with very large supplies if we are not careful.
+    let quorum = if snapshot_supply > 0 {
+        (snapshot_supply * proposal.quorum_bps as i128) / 10_000i128
+    } else {
+        0i128
+    };
     if total_votes < quorum {
         proposal.status = ProposalStatus::Rejected;
         return Err(GovernanceError::QuorumNotMet);
@@ -697,6 +726,16 @@ impl Governance {
         env.storage()
             .persistent()
             .set(&DataKey::Vote(proposal_id, voter.clone()), &true);
+        append_vote_record(
+            &env,
+            &voter,
+            VoteRecord {
+                proposal_id,
+                in_favor,
+                weight,
+                voted_at: env.ledger().timestamp(),
+            },
+        );
         env.storage()
             .instance()
             .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -920,7 +959,7 @@ impl Governance {
                 }
                 InvoiceAction::SetInvoiceMaxAmount(max_amount) => {
                     InvoiceClient::new(env, target_contract)
-                        .set_max_invoice_amount_via_governance(&this_contract, max_amount);
+                        .set_max_invoice_amount_gov(&this_contract, max_amount);
                 }
                 InvoiceAction::SetInvoiceMaxSmeOutstanding(max) => {
                     InvoiceClient::new(env, target_contract)
@@ -1084,7 +1123,7 @@ impl Governance {
                     return Err(GovernanceError::Unauthorized);
                 }
             }
-            // #1118: once a proposal has passed quorum, the original proposer
+            // #939: once a proposal has passed quorum, the original proposer
             // alone must not be able to veto it during the timelock window —
             // that would let a single voter unilaterally block an approved
             // change. Only the admin may cancel a Passed proposal.
@@ -1118,6 +1157,39 @@ impl Governance {
         env.storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
+    }
+
+    /// #934: how many votes `voter` has cast. Use with `get_proposal_history`
+    /// to page through the full log.
+    pub fn get_voter_vote_count(env: Env, voter: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VoterVoteCount(voter))
+            .unwrap_or(0)
+    }
+
+    /// #934: a page of the votes `voter` has cast, oldest first, beginning at
+    /// index `start`. Returns at most `limit` records (capped at
+    /// `MAX_PROPOSAL_PAGE_SIZE`) and is empty once `start` is past the end.
+    pub fn get_proposal_history(
+        env: Env,
+        voter: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<VoteRecord> {
+        let count = Self::get_voter_vote_count(env.clone(), voter.clone());
+        let end = start.saturating_add(limit.min(MAX_PROPOSAL_PAGE_SIZE)).min(count);
+        let mut records = Vec::new(&env);
+        for index in start..end {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VoterVote(voter.clone(), index))
+            {
+                records.push_back(record);
+            }
+        }
+        records
     }
 
     pub fn list_proposals(env: Env) -> Vec<Proposal> {

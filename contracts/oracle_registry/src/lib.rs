@@ -273,6 +273,7 @@ impl OracleRegistryContract {
         env.storage().instance().set(&DataKey::Config, &config);
         env.events()
             .publish((EVT, symbol_short!("trsr_set")), admin);
+            .publish((EVT, symbol_short!("trs_set")), admin);
         Ok(())
     }
 

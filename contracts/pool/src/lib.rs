@@ -3629,6 +3629,11 @@ impl FundingPool {
                 SETTLEMENT_COLLATERAL_TTL,
                 SETTLEMENT_COLLATERAL_TTL,
             );
+
+            // #1475: Transfer the seized collateral token to the auction contract
+            let token_client = token::Client::new(&env, &deposit.token);
+            token_client.transfer(&env.current_contract_address(), &caller, &deposit.amount);
+
             // #1036: matches execute_seize_collateral's own seizure event
             // (col_seiz_default/liq_seized), which also doesn't carry token —
             // this seizure record mirrors that established shape.
@@ -4325,6 +4330,8 @@ impl FundingPool {
         env.storage()
             .instance()
             .set(&DataKey::FeeTier(tier_id), &tier);
+        env.events()
+            .publish((EVT, symbol_short!("set_fee")), (admin, tier_id, tier));
         Ok(())
     }
 
@@ -4354,6 +4361,8 @@ impl FundingPool {
         }
         env.storage().instance().set(&DataKey::FeeTierIds, &new_ids);
         env.storage().instance().remove(&DataKey::FeeTier(tier_id));
+        env.events()
+            .publish((EVT, symbol_short!("rm_fee")), (admin, tier_id));
         Ok(())
     }
 
@@ -4391,6 +4400,10 @@ impl FundingPool {
         env.storage()
             .instance()
             .set(&DataKey::CreditScoreContract, &credit_score_contract);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("cfg_upd")),
+            credit_score_contract,
+        );
         Ok(())
     }
 
@@ -4411,6 +4424,10 @@ impl FundingPool {
         env.storage()
             .instance()
             .set(&INSURANCE_CFG, &insurance_contract);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("cfg_upd")),
+            insurance_contract,
+        );
         Ok(())
     }
 
@@ -7939,6 +7956,36 @@ mod test {
         (client, admin, usdc_id, share_token)
     }
 
+    // #915: only the configured insurance contract may credit a payout into
+    // pool accounting. Any other caller must be rejected with no state change.
+    #[test]
+    fn test_insurance_payout_rejected_from_unconfigured_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, usdc, _share) = setup(&env);
+        let insurance = Address::generate(&env);
+        client.set_insurance_contract(&admin, &insurance);
+        let attacker = Address::generate(&env);
+        let before = client.get_token_totals(&usdc).pool_value;
+
+        let result = client.try_receive_insurance_payout(&attacker, &usdc, &1u64, &1_000i128);
+        assert_eq!(result, Err(Ok(PoolError::Unauthorized)));
+        assert_eq!(client.get_token_totals(&usdc).pool_value, before);
+    }
+
+    #[test]
+    fn test_insurance_payout_credits_pool_from_configured_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, usdc, _share) = setup(&env);
+        let insurance = Address::generate(&env);
+        client.set_insurance_contract(&admin, &insurance);
+        let before = client.get_token_totals(&usdc).pool_value;
+
+        client.receive_insurance_payout(&insurance, &usdc, &1u64, &1_000i128);
+        assert_eq!(client.get_token_totals(&usdc).pool_value, before + 1_000);
+    }
+
     fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
         soroban_sdk::token::StellarAssetClient::new(env, token_id).mint(to, &amount);
     }
@@ -8546,6 +8593,50 @@ mod test {
 
         client.remove_fee_tier(&admin, &1u32);
         assert!(client.get_fee_tier(&1u32).is_none());
+    }
+
+    #[test]
+    fn test_fee_tier_set_and_remove_emit_events() {
+        // #1511: fee-tier admin mutations must be observable off-chain.
+        use soroban_sdk::testutils::Events;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _usdc_id, _share_token) = setup(&env);
+
+        let tier = FeeTier {
+            min_amount: 0,
+            max_amount: 100_000,
+            min_credit_score: 500,
+            fee_bps: 150,
+        };
+        client.set_fee_tier(&admin, &1u32, &tier);
+
+        let expected_set: soroban_sdk::Vec<soroban_sdk::Val> =
+            (EVT, symbol_short!("set_fee")).into_val(&env);
+        let set_event = env
+            .events()
+            .all()
+            .iter()
+            .find(|e| e.1 == expected_set)
+            .expect("set_fee event not emitted");
+        let (event_admin, event_tier_id, event_tier): (Address, u32, FeeTier) =
+            set_event.2.into_val(&env);
+        assert_eq!(event_admin, admin);
+        assert_eq!(event_tier_id, 1u32);
+        assert_eq!(event_tier, tier);
+
+        client.remove_fee_tier(&admin, &1u32);
+        let expected_remove: soroban_sdk::Vec<soroban_sdk::Val> =
+            (EVT, symbol_short!("rm_fee")).into_val(&env);
+        let remove_event = env
+            .events()
+            .all()
+            .iter()
+            .find(|e| e.1 == expected_remove)
+            .expect("rm_fee event not emitted");
+        let (event_admin, event_tier_id): (Address, u32) = remove_event.2.into_val(&env);
+        assert_eq!(event_admin, admin);
+        assert_eq!(event_tier_id, 1u32);
     }
 
     // ---- Issue #61: Edge-Case Tests ----

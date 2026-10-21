@@ -398,6 +398,69 @@ fn test_cannot_vote_twice() {
     assert!(result.is_err(), "double vote must fail");
 }
 
+// ── get_proposal_history (#934: per-voter vote log) ──────────────────────────
+
+#[test]
+fn test_proposal_history_lists_each_vote_for_voter_in_order() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (share, share_id, _share_admin) = setup_share(&env);
+    let (gov, _, target_id) = setup_governance(&env, &share_id);
+
+    let proposer = Address::generate(&env);
+    let voter = Address::generate(&env);
+    share.mint(&proposer, &1_000i128);
+    share.mint(&voter, &100_000i128);
+
+    let first_id = make_proposal(&env, &gov, &proposer, &target_id);
+    let second_id = make_proposal(&env, &gov, &proposer, &target_id);
+
+    gov.vote(&first_id, &voter, &true);
+    gov.vote(&second_id, &voter, &false);
+
+    assert_eq!(gov.get_voter_vote_count(&voter), 2);
+
+    let history = gov.get_proposal_history(&voter, &0, &10);
+    assert_eq!(history.len(), 2);
+    let first = history.get(0).unwrap();
+    let second = history.get(1).unwrap();
+    assert_eq!(first.proposal_id, first_id);
+    assert!(first.in_favor);
+    assert!(first.weight > 0);
+    assert_eq!(second.proposal_id, second_id);
+    assert!(!second.in_favor);
+}
+
+#[test]
+fn test_proposal_history_pages_and_is_empty_for_non_voters() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (share, share_id, _share_admin) = setup_share(&env);
+    let (gov, _, target_id) = setup_governance(&env, &share_id);
+
+    let proposer = Address::generate(&env);
+    let voter = Address::generate(&env);
+    share.mint(&proposer, &1_000i128);
+    share.mint(&voter, &100_000i128);
+
+    let first_id = make_proposal(&env, &gov, &proposer, &target_id);
+    let second_id = make_proposal(&env, &gov, &proposer, &target_id);
+    gov.vote(&first_id, &voter, &true);
+    gov.vote(&second_id, &voter, &true);
+
+    let page = gov.get_proposal_history(&voter, &1, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().proposal_id, second_id);
+
+    assert_eq!(gov.get_proposal_history(&voter, &2, &10).len(), 0);
+    assert_eq!(gov.get_proposal_history(&proposer, &0, &10).len(), 0);
+    assert_eq!(gov.get_voter_vote_count(&proposer), 0);
+}
+
 // ── cancel_proposal (#1118: proposer must not be able to veto a Passed
 //    proposal unilaterally — only Active proposals are proposer-cancellable) ─
 

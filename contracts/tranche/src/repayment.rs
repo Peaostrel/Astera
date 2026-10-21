@@ -94,8 +94,8 @@ pub fn allocate_loss(env: &Env, token: Address, invoice_id: u64, shortfall: i128
         // Reduce junior's deployed/available proportionally
         let junior_total = pool.junior.deployed + pool.junior.available;
         if junior_total > 0 {
-            let deployed_ratio = pool.junior.deployed as u128 / junior_total as u128;
-            let available_loss = junior_loss - (junior_loss as u128 * deployed_ratio) as i128;
+            let deployed_ratio = (pool.junior.deployed as u128 * 10_000) / junior_total as u128;
+            let available_loss = (junior_loss as u128 * (10_000 - deployed_ratio) / 10_000) as i128;
             let deployed_loss = junior_loss - available_loss;
             pool.junior.deployed -= deployed_loss;
             pool.junior.available -= available_loss;
@@ -107,17 +107,21 @@ pub fn allocate_loss(env: &Env, token: Address, invoice_id: u64, shortfall: i128
         pool.senior.losses += senior_loss;
         let senior_total = pool.senior.deployed + pool.senior.available;
         if senior_total > 0 {
-            let deployed_ratio = pool.senior.deployed as u128 / senior_total as u128;
-            let available_loss = senior_loss - (senior_loss as u128 * deployed_ratio) as i128;
+            let deployed_ratio = (pool.senior.deployed as u128 * 10_000) / senior_total as u128;
+            let available_loss = (senior_loss as u128 * (10_000 - deployed_ratio) / 10_000) as i128;
             let deployed_loss = senior_loss - available_loss;
             pool.senior.deployed -= deployed_loss;
             pool.senior.available -= available_loss;
         }
     }
 
-    // Remove deployed amounts from this invoice
-    pool.senior.deployed -= exposure.senior_deployed;
-    pool.junior.deployed -= exposure.junior_deployed;
+    // Remove deployed amounts from this invoice (only if no loss was charged against deployed capital)
+    if junior_loss == 0 {
+        pool.junior.deployed -= exposure.junior_deployed;
+    }
+    if senior_loss == 0 {
+        pool.senior.deployed -= exposure.senior_deployed;
+    }
 
     env.storage()
         .instance()

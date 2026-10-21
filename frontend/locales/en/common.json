@@ -1,4 +1,5 @@
 {
+  "Arbitration": {
   "Dashboard": {
     "title": "SME Dashboard",
     "description": "Manage your tokenized invoices",
@@ -60,6 +61,7 @@
     "notifications": {
       "loadError": "Failed to load invoices. Make sure contracts are deployed."
     }
+  },
   },
   "Notifications": {
     "wallet": {

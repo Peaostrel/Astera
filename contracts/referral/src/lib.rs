@@ -57,9 +57,9 @@ pub enum ReferralError {
     AccessControlNotConfigured = 6,
     InvalidRewardCap = 7,
     RewardOverflow = 8,
-    ReferralCycle = 7,
-    InvalidActivityKind = 8,
-    NotInitialized = 9,
+    ReferralCycle = 9,
+    InvalidActivityKind = 10,
+    NotInitialized = 11,
 }
 
 #[contracttype]

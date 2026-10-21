@@ -143,8 +143,10 @@ pub enum InvoiceError {
     HashMismatch = 4,
     SmeExposureLimitExceeded = 5,
     AmountOverflow = 6,
-    // #436: string field validation errors
-    EmptyField = 7,
+    // Invalid contract configuration (for example, a zero duration).
+    // Reuses the obsolete generic string-validation slot so this enum remains
+    // within Soroban's 50-variant contract-spec limit.
+    InvalidConfig = 7,
     FieldTooLong = 8,
     DateOverflow = 9,
     // #406: metadata URL validation
@@ -222,8 +224,6 @@ pub enum InvoiceError {
     UnauthorizedArbitration = 47,
     InvalidRespondent = 48,
     ArbitrationRequired = 49,
-    // #1038: governance contract not configured - using discriminant 50 (at limit)
-    GovernanceNotConfigured = 50,
 }
 
 #[contracttype]
@@ -422,7 +422,7 @@ fn require_governance(env: &Env, caller: &Address) {
     match configured {
         Some(configured) if &configured == caller => {}
         Some(_) => panic_with_error!(env, InvoiceError::Unauthorized),
-        None => panic_with_error!(env, InvoiceError::GovernanceNotConfigured),
+        None => panic_with_error!(env, InvoiceError::AccessControlNotConfigured),
     }
 }
 
@@ -1526,7 +1526,7 @@ impl InvoiceContract {
     }
 
     // #1038: Set max invoice amount via governance proposal.
-    pub fn set_max_invoice_amount_via_governance(
+    pub fn set_max_invoice_amount_gov(
         env: Env,
         governance: Address,
         max_invoice_amount: i128,
@@ -1561,7 +1561,7 @@ impl InvoiceContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::MaxSmeOutstanding, &max);
+            .set(&DataKey::MaxOutstandingPerSme, &max);
         bump_instance(&env);
         env.events()
             .publish((EVT, Symbol::new(&env, "gov_sme_max")), (governance, max));
@@ -1711,7 +1711,7 @@ impl InvoiceContract {
         require_not_paused(&env);
         env.storage()
             .instance()
-            .set(&DataKey::ConsensusRequired, &required);
+            .set(&DataKey::RequireConsensusVerification, &required);
         bump_instance(&env);
         env.events()
             .publish((EVT, Symbol::new(&env, "gov_cons")), (governance, required));
@@ -1791,11 +1791,11 @@ impl InvoiceContract {
         let old_required: bool = env
             .storage()
             .instance()
-            .get(&DataKey::OracleVerifiedFundingOnly)
+            .get(&DataKey::RequireOracleVerification)
             .unwrap_or(false);
         env.storage()
             .instance()
-            .set(&DataKey::OracleVerifiedFundingOnly, &required);
+            .set(&DataKey::RequireOracleVerification, &required);
         bump_instance(&env);
         env.events().publish(
             (EVT, Symbol::new(&env, "gov_orc_fund")),
@@ -1869,7 +1869,7 @@ impl InvoiceContract {
         require_governance(&env, &governance);
         env.storage()
             .instance()
-            .set(&DataKey::MinDueDateWindow, &window_secs);
+            .set(&DataKey::MinDueDateWindowSecs, &window_secs);
         bump_instance(&env);
         env.events().publish(
             (EVT, Symbol::new(&env, "gov_min_due")),
@@ -2754,6 +2754,12 @@ impl InvoiceContract {
         pool.require_auth();
         require_not_paused(&env);
         bump_instance(&env);
+        
+        // Validate amount is positive
+        if amount <= 0 {
+            panic_with_error!(&env, InvoiceError::InvalidAmount);
+        }
+        
         let authorized_pool: Address = env
             .storage()
             .instance()
@@ -2787,6 +2793,13 @@ impl InvoiceContract {
         env.storage()
             .persistent()
             .set(&DataKey::InvoiceFunding(id), &new_funded);
+        
+        // Emit funding event
+        env.events().publish(
+            (symbol_short!("invoice"), symbol_short!("funded")),
+            (id, pool, amount, new_funded),
+        );
+        
         new_funded
     }
 
