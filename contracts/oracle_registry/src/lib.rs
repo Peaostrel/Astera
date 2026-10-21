@@ -271,6 +271,8 @@ impl OracleRegistryContract {
         let mut config = Self::load_config(&env)?;
         config.treasury = treasury;
         env.storage().instance().set(&DataKey::Config, &config);
+        env.events()
+            .publish((EVT, symbol_short!("trsr_set")), admin);
         Ok(())
     }
 
