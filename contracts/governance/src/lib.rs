@@ -29,6 +29,12 @@ const DEFAULT_CRITICAL_QUORUM_BPS: u32 = 5_000;
 /// the conditions that justified it have changed.
 const MAX_PROPOSAL_PAGE_SIZE: u32 = 50;
 
+fn bump_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+}
+
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProposalStatus {
@@ -503,6 +509,8 @@ fn finalize_proposal(env: &Env, proposal: &mut Proposal) -> GovernanceResult<()>
     };
     if total_votes < quorum {
         proposal.status = ProposalStatus::Rejected;
+        env.events()
+            .publish((EVT, symbol_short!("rejected")), (proposal.id, symbol_short!("quorum")));
         return Err(GovernanceError::QuorumNotMet);
     }
 
@@ -515,6 +523,8 @@ fn finalize_proposal(env: &Env, proposal: &mut Proposal) -> GovernanceResult<()>
             .publish((EVT, symbol_short!("passed")), proposal.id);
     } else {
         proposal.status = ProposalStatus::Rejected;
+        env.events()
+            .publish((EVT, symbol_short!("rejected")), (proposal.id, symbol_short!("votes")));
     }
 
     Ok(())
@@ -532,6 +542,8 @@ fn mark_expired_if_due(env: &Env, proposal: &mut Proposal) -> bool {
         && env.ledger().timestamp() > proposal.passed_at.saturating_add(expiry_secs)
     {
         proposal.status = ProposalStatus::Expired;
+        env.events()
+            .publish((EVT, symbol_short!("expired")), proposal.id);
         true
     } else {
         proposal.status == ProposalStatus::Expired
@@ -609,6 +621,8 @@ impl Governance {
             &DEFAULT_EXECUTION_EXPIRY_SECS,
         );
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((EVT, symbol_short!("init")), admin);
         bump_instance(&env);
         Ok(())
     }
