@@ -222,7 +222,7 @@ function summarizeAction(action: ActionPayload): string {
     case 'SetScreenerTimelock':
       return `Set Screener Timelock → ${action.values[0]}s`;
     case 'UpdateGovernanceConfig':
-      return `Update Config → quorum ${action.values[0]}bps, pass ${action.values[1]}bps`;
+      return `Update Config → quorum ${action.values[0]}bps, pass ${action.values[1]}bps, exec delay ${action.values[2]}s`;
     case 'SetCategoryQuorum':
       return `Set Category Quorum (category ${action.values[0]}) → ${action.values[1]}bps`;
     case 'SetReferralPaused':
@@ -393,7 +393,7 @@ export default function RolesAdminPage() {
       case 'UpdateGovernanceConfig':
         return {
           tag: 'UpdateGovernanceConfig',
-          values: [num('quorumBps'), num('passBps')],
+          values: [num('quorumBps'), num('passBps'), num('executionDelaySecs')],
         };
       case 'SetCategoryQuorum':
         return {
@@ -1108,7 +1108,7 @@ function ActionFields({
       );
     case 'UpdateGovernanceConfig':
       return (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-3 gap-3">
           <input
             type="number"
             placeholder="Quorum bps"
@@ -1121,6 +1121,13 @@ function ActionFields({
             placeholder="Pass bps"
             value={fields.passBps ?? ''}
             onChange={set('passBps')}
+            className={inputClass}
+          />
+          <input
+            type="number"
+            placeholder="Execution delay (secs)"
+            value={fields.executionDelaySecs ?? ''}
+            onChange={set('executionDelaySecs')}
             className={inputClass}
           />
         </div>

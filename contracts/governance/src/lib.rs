@@ -1310,6 +1310,32 @@ impl Governance {
         Ok(())
     }
 
+    /// Change the post-passage timelock (execution delay) for proposals created
+    /// after this call. Must be > 0.
+    pub fn set_execution_delay(
+        env: Env,
+        caller: Address,
+        execution_delay_secs: u64,
+    ) -> Result<(), GovernanceError> {
+        caller.require_auth();
+        require_not_paused(&env)?;
+        if execution_delay_secs == 0 {
+            return Err(GovernanceError::InvalidConfig);
+        }
+        let mut config = load_config(&env)?;
+        if caller != config.admin {
+            return Err(GovernanceError::Unauthorized);
+        }
+        config.execution_delay_secs = execution_delay_secs;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish(
+            (EVT, symbol_short!("exec_dly")),
+            (caller, execution_delay_secs),
+        );
+        bump_instance(&env);
+        Ok(())
+    }
+
     pub fn get_execution_expiry(env: Env) -> Result<u64, GovernanceError> {
         load_config(&env)?;
         Ok(env
@@ -1605,6 +1631,29 @@ impl Governance {
             (EVT, symbol_short!("ac_cat_q")),
             (access_control, category, quorum_bps),
         );
+        Ok(())
+    }
+
+    /// Multisig admin path for `set_execution_delay`.
+    pub fn set_execution_delay_via_ac(
+        env: Env,
+        access_control: Address,
+        execution_delay_secs: u64,
+    ) -> Result<(), GovernanceError> {
+        access_control.require_auth();
+        require_not_paused(&env)?;
+        require_access_control(&env, &access_control)?;
+        if execution_delay_secs == 0 {
+            return Err(GovernanceError::InvalidConfig);
+        }
+        let mut config = load_config(&env)?;
+        config.execution_delay_secs = execution_delay_secs;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish(
+            (EVT, symbol_short!("ac_excdly")),
+            (access_control, execution_delay_secs),
+        );
+        bump_instance(&env);
         Ok(())
     }
 }

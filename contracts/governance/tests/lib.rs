@@ -719,6 +719,52 @@ fn test_update_min_share_balance_rejects_non_positive_value() {
     assert_eq!(result, Err(Ok(GovernanceError::InvalidConfig)));
 }
 
+#[test]
+fn test_set_execution_delay_by_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (_share, share_id, _share_admin) = setup_share(&env);
+    let (gov, gov_admin, _target_id) = setup_governance(&env, &share_id);
+
+    // Default execution delay is 48 hours (172800 seconds)
+    let config = gov.get_config();
+    assert_eq!(config.execution_delay_secs, 172_800);
+
+    // Update to 24 hours (86400 seconds)
+    gov.set_execution_delay(&gov_admin, &86_400);
+    let config = gov.get_config();
+    assert_eq!(config.execution_delay_secs, 86_400);
+}
+
+#[test]
+fn test_set_execution_delay_rejects_non_admin_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (_share, share_id, _share_admin) = setup_share(&env);
+    let (gov, _gov_admin, _target_id) = setup_governance(&env, &share_id);
+
+    let impostor = Address::generate(&env);
+    let result = gov.try_set_execution_delay(&impostor, &86_400);
+    assert_eq!(result, Err(Ok(GovernanceError::Unauthorized)));
+}
+
+#[test]
+fn test_set_execution_delay_rejects_zero_value() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+
+    let (_share, share_id, _share_admin) = setup_share(&env);
+    let (gov, gov_admin, _target_id) = setup_governance(&env, &share_id);
+
+    let result = gov.try_set_execution_delay(&gov_admin, &0);
+    assert_eq!(result, Err(Ok(GovernanceError::InvalidConfig)));
+}
+
 // ── passed proposals expire if not executed in time ──────────────────────────
 
 #[test]

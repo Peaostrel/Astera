@@ -136,4 +136,5 @@ export interface GovernanceConfig {
   treasury_pass_bps: number;
   critical_pass_bps: number;
   execution_expiry_secs: number;
+  execution_delay_secs: number;
 }

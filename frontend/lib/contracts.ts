@@ -4282,6 +4282,7 @@ function actionPayloadToScVal(action: ActionPayload): xdr.ScVal {
         tag,
         nativeToScVal(action.values[0], { type: 'u32' }),
         nativeToScVal(action.values[1], { type: 'u32' }),
+        nativeToScVal(action.values[2], { type: 'u64' }),
       ]);
     case 'SetCategoryQuorum':
       return xdr.ScVal.scvVec([
