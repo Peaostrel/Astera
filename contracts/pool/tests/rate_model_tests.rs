@@ -304,6 +304,81 @@ fn test_cancel_proposal_blocks_execution() {
     assert_eq!(result, Err(Ok(PoolError::RateModelProposalNotFound)));
 }
 
+/// #911: a rate model change must wait for the admin operation delay, even when that
+/// delay is longer than the yield timelock.
+#[test]
+fn test_rate_change_respects_operation_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id) = setup(&env);
+
+    client.set_operation_delay(&admin, &259_200u64); // 72h, longer than the 48h timelock
+    client.propose_rate_model_change(&admin, &usdc_id, &standard_model());
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += YIELD_TIMELOCK_SECS); // 48h
+    let result = client.try_execute_rate_model_change(&usdc_id);
+    assert_eq!(result, Err(Ok(PoolError::RateModelChangeNotReady)));
+
+    env.ledger().with_mut(|l| l.timestamp += 86_400); // 72h total
+    client.execute_rate_model_change(&usdc_id);
+    assert_eq!(
+        client.get_rate_model_config(&usdc_id),
+        Some(standard_model())
+    );
+}
+
+const ONE_YEAR_SECS: u64 = 31_536_000;
+
+/// #913: with no capital deployed there is nothing to earn, so the estimate is zero.
+#[test]
+fn test_estimate_deposit_yield_is_zero_without_deployed_capital() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, usdc_id) = setup(&env);
+
+    assert_eq!(
+        client.estimate_deposit_yield(&usdc_id, &10_000i128, &ONE_YEAR_SECS),
+        0
+    );
+}
+
+#[test]
+fn test_estimate_deposit_yield_rejects_zero_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, usdc_id) = setup(&env);
+
+    let result = client.try_estimate_deposit_yield(&usdc_id, &0i128, &ONE_YEAR_SECS);
+    assert_eq!(result, Err(Ok(PoolError::ZeroAmount)));
+}
+
+/// #913: the estimate grows with the horizon and with the size of the deposit, and is
+/// positive once capital is deployed.
+#[test]
+fn test_estimate_deposit_yield_scales_with_horizon_and_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id) = setup(&env);
+
+    let investor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    mint(&env, &usdc_id, &investor, 100_000);
+    client.deposit(&investor, &usdc_id, &100_000, &None);
+    enact_rate_model(&client, &admin, &usdc_id, &env);
+
+    let due_date = env.ledger().timestamp() + 1_000_000;
+    client.fund_invoice(&admin, &1u64, &50_000i128, &borrower, &due_date, &usdc_id);
+
+    let one_year = client.estimate_deposit_yield(&usdc_id, &10_000i128, &ONE_YEAR_SECS);
+    let two_years = client.estimate_deposit_yield(&usdc_id, &10_000i128, &(2 * ONE_YEAR_SECS));
+    let larger_deposit = client.estimate_deposit_yield(&usdc_id, &30_000i128, &ONE_YEAR_SECS);
+
+    assert!(one_year > 0);
+    assert!(two_years > one_year);
+    assert!(larger_deposit > one_year);
+}
+
 #[test]
 fn test_cooldown_enforced_between_executed_changes() {
     let env = Env::default();

@@ -302,6 +302,9 @@ pub struct RateSnapshot {
 pub struct RateModelProposal {
     pub config: RateModelConfig,
     pub proposed_at: u64,
+    // #911: fixed at proposal time from the stricter of the yield timelock and the
+    // admin operation delay, so a later config change cannot shorten the review window.
+    pub execute_after: u64,
 }
 
 #[contracttype]
@@ -2868,84 +2871,114 @@ impl FundingPool {
             }
         }
 
-        let distributable_amount = remaining_amount;
+        // #912: serve the longest-waiting requests first instead of walking the queue
+        // in insertion order. Requests queued at the same timestamp form one cohort
+        // that shares its budget pro-rata; each cohort is settled before any younger
+        // one receives liquidity, and whatever a capped request leaves unused flows
+        // on to the next cohort.
         let mut remaining_queue = Vec::new(env);
-        for request in due_by_age.iter() {
-            let available_for_request = distributable_amount
-                .checked_mul(request.shares)
-                .and_then(|value| value.checked_div(total_due_shares))
-                .ok_or(PoolError::AmountOverflow)?;
-            let request_amount =
-                Self::withdrawal_amount(request.shares, valuation_pool_value, total_shares)?;
-            let payout = if available_for_request > request_amount {
-                request_amount
-            } else {
-                available_for_request
-            };
-
-            if payout <= 0 {
-                remaining_queue.push_back(request);
-                continue;
+        let mut pending = due_by_age;
+        while !pending.is_empty() {
+            let mut oldest_requested_at = u64::MAX;
+            for request in pending.iter() {
+                if request.requested_at < oldest_requested_at {
+                    oldest_requested_at = request.requested_at;
+                }
             }
 
-            let shares_to_burn = if payout == request_amount {
-                request.shares
-            } else {
-                payout
+            let mut cohort = Vec::new(env);
+            let mut younger = Vec::new(env);
+            let mut cohort_shares: i128 = 0;
+            for request in pending.iter() {
+                if request.requested_at == oldest_requested_at {
+                    cohort_shares = cohort_shares
+                        .checked_add(request.shares)
+                        .ok_or(PoolError::AmountOverflow)?;
+                    cohort.push_back(request);
+                } else {
+                    younger.push_back(request);
+                }
+            }
+            pending = younger;
+
+            let cohort_budget = remaining_amount;
+            for request in cohort.iter() {
+                let available_for_request = cohort_budget
                     .checked_mul(request.shares)
-                    .and_then(|value| value.checked_div(request_amount))
-                    .ok_or(PoolError::AmountOverflow)?
-            };
-
-            Self::settle_queued_withdrawal(
-                env,
-                &token,
-                &share_token,
-                &request,
-                shares_to_burn,
-                payout,
-            )?;
-            tt.pool_value = tt
-                .pool_value
-                .checked_sub(payout)
-                .ok_or(PoolError::AmountOverflow)?;
-            remaining_amount = remaining_amount
-                .checked_sub(payout)
-                .ok_or(PoolError::AmountOverflow)?;
-
-            if shares_to_burn == request.shares {
-                let request_key =
-                    DataKey::WithdrawalRequest(request.investor.clone(), request.request_id);
-                env.storage().persistent().remove(&request_key);
-                env.events().publish(
-                    (EVT, symbol_short!("wd_full")),
-                    (
-                        request.investor,
-                        request.token.clone(),
-                        payout,
-                        request.shares,
-                        request.request_id,
-                    ),
-                );
-            } else {
-                let remaining_request = WithdrawalRequest {
-                    investor: request.investor.clone(),
-                    token: request.token.clone(),
-                    shares: request
-                        .shares
-                        .checked_sub(shares_to_burn)
-                        .ok_or(PoolError::AmountOverflow)?,
-                    requested_at: request.requested_at,
-                    request_id: request.request_id,
+                    .and_then(|value| value.checked_div(cohort_shares))
+                    .ok_or(PoolError::AmountOverflow)?;
+                let request_amount =
+                    Self::withdrawal_amount(request.shares, valuation_pool_value, total_shares)?;
+                let payout = if available_for_request > request_amount {
+                    request_amount
+                } else {
+                    available_for_request
                 };
-                let request_key = DataKey::WithdrawalRequest(
-                    remaining_request.investor.clone(),
-                    remaining_request.request_id,
-                );
-                env.storage()
-                    .persistent()
-                    .set(&request_key, &remaining_request);
-                remaining_queue.push_back(remaining_request);
+
+                if payout <= 0 {
+                    remaining_queue.push_back(request);
+                    continue;
+                }
+
+                let shares_to_burn = if payout == request_amount {
+                    request.shares
+                } else {
+                    payout
+                        .checked_mul(request.shares)
+                        .and_then(|value| value.checked_div(request_amount))
+                        .ok_or(PoolError::AmountOverflow)?
+                };
+
+                Self::settle_queued_withdrawal(
+                    env,
+                    &token,
+                    &share_token,
+                    &request,
+                    shares_to_burn,
+                    payout,
+                )?;
+                tt.pool_value = tt
+                    .pool_value
+                    .checked_sub(payout)
+                    .ok_or(PoolError::AmountOverflow)?;
+                remaining_amount = remaining_amount
+                    .checked_sub(payout)
+                    .ok_or(PoolError::AmountOverflow)?;
+
+                if shares_to_burn == request.shares {
+                    let request_key =
+                        DataKey::WithdrawalRequest(request.investor.clone(), request.request_id);
+                    env.storage().persistent().remove(&request_key);
+                    env.events().publish(
+                        (EVT, symbol_short!("wd_full")),
+                        (
+                            request.investor,
+                            request.token.clone(),
+                            payout,
+                            request.shares,
+                            request.request_id,
+                        ),
+                    );
+                } else {
+                    let remaining_request = WithdrawalRequest {
+                        investor: request.investor.clone(),
+                        token: request.token.clone(),
+                        shares: request
+                            .shares
+                            .checked_sub(shares_to_burn)
+                            .ok_or(PoolError::AmountOverflow)?,
+                        requested_at: request.requested_at,
+                        request_id: request.request_id,
+                    };
+                    let request_key = DataKey::WithdrawalRequest(
+                        remaining_request.investor.clone(),
+                        remaining_request.request_id,
+                    );
+                    env.storage()
+                        .persistent()
+                        .set(&request_key, &remaining_request);
+                    remaining_queue.push_back(remaining_request);
+                }
             }
         }
 
@@ -4149,11 +4182,22 @@ impl FundingPool {
             return Err(PoolError::InvalidAmount);
         }
 
+        // #911: the review window is the stricter of the yield timelock and the
+        // #742 admin operation delay (default 24h), so a rate model change can never
+        // execute sooner than `operation_delay` after it was proposed.
+        let operation_delay: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OperationDelaySecs)
+            .unwrap_or(OPERATION_DELAY_SECS);
+        let delay = config.yield_timelock_secs.max(operation_delay);
+        let effective_at = now.saturating_add(delay);
+
         let proposal = RateModelProposal {
             config: new_config,
             proposed_at: now,
+            execute_after: effective_at,
         };
-        let effective_at = now + config.yield_timelock_secs;
         env.storage()
             .instance()
             .set(&DataKey::PendingRateModel(token.clone()), &proposal);
@@ -4166,11 +4210,6 @@ impl FundingPool {
 
     pub fn execute_rate_model_change(env: Env, token: Address) -> Result<(), PoolError> {
         bump_instance(&env);
-        let config: PoolConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config)
-            .ok_or(PoolError::NotInitialized)?;
         let proposal: RateModelProposal = env
             .storage()
             .instance()
@@ -4178,10 +4217,7 @@ impl FundingPool {
             .ok_or(PoolError::RateModelProposalNotFound)?;
 
         let now = env.ledger().timestamp();
-        let effective_at = proposal
-            .proposed_at
-            .saturating_add(config.yield_timelock_secs);
-        if now < effective_at {
+        if now < proposal.execute_after {
             return Err(PoolError::RateModelChangeNotReady);
         }
 
@@ -6321,6 +6357,13 @@ impl FundingPool {
 
             require_kyc_approved(&env, &to)?;
 
+            // #914: from == to would read one storage slot twice and write back the
+            // inflated sum, minting bps out of nothing. Mirrors the seller == buyer
+            // guard in market_settle_listing.
+            if from == to {
+                return Err(PoolError::Unauthorized);
+            }
+
             let from_key = DataKey::CoFundShare(invoice_id, from.clone());
             let to_key = DataKey::CoFundShare(invoice_id, to.clone());
 
@@ -6670,6 +6713,76 @@ impl FundingPool {
         } else {
             Ok(remaining)
         }
+    }
+
+    /// #913: investor-side counterpart to `estimate_repayment`. Returns the interest,
+    /// in USDC-equivalent units, that a deposit of `amount` would earn over
+    /// `horizon_secs` if the pool's current deployed capital and rate persisted.
+    /// Utilization and the rate are recomputed as if the deposit had already landed,
+    /// since the deposit dilutes utilization and can move the rate curve.
+    pub fn estimate_deposit_yield(
+        env: Env,
+        token: Address,
+        amount: i128,
+        horizon_secs: u64,
+    ) -> Result<i128, PoolError> {
+        bump_instance(&env);
+        if amount == 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+        if amount < 0 {
+            return Err(PoolError::NegativeAmount);
+        }
+        Self::assert_accepted_token(&env, &token)?;
+        let config = get_config_cached(&env)?;
+        let tt: PoolTokenTotals = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenTotals(token.clone()))
+            .unwrap_or_default();
+
+        // Same normalisation deposit() applies before crediting the position.
+        let exchange_rate_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExchangeRate(token.clone()))
+            .unwrap_or(10_000u32);
+        let usdc_received = (amount * exchange_rate_bps as i128) / 10_000i128;
+        let pool_after = tt
+            .pool_value
+            .checked_add(usdc_received)
+            .ok_or(PoolError::AmountOverflow)?;
+        if usdc_received <= 0 || pool_after <= 0 {
+            return Ok(0);
+        }
+
+        let utilization_after = utilization_bps(&PoolTokenTotals {
+            pool_value: pool_after,
+            ..tt.clone()
+        });
+        let yield_bps = match env
+            .storage()
+            .instance()
+            .get::<DataKey, RateModelConfig>(&DataKey::RateModel(token.clone()))
+        {
+            Some(model) => compute_current_rate(utilization_after, &model),
+            None => config.yield_bps,
+        };
+
+        // Interest the deployed book earns over the horizon, split pro-rata by the
+        // deposit's slice of the post-deposit pool value (the same split that shares
+        // minted in deposit() imply).
+        let pool_interest = calculate_interest(
+            tt.total_deployed.max(0) as u128,
+            yield_bps,
+            horizon_secs,
+            config.compound_interest,
+        )?;
+        let investor_share = pool_interest
+            .checked_mul(usdc_received as u128)
+            .and_then(|value| value.checked_div(pool_after as u128))
+            .ok_or(PoolError::AmountOverflow)?;
+        i128::try_from(investor_share).map_err(|_| PoolError::AmountOverflow)
     }
 
     pub fn is_invoice_repaid(env: Env, invoice_id: u64) -> Result<bool, PoolError> {

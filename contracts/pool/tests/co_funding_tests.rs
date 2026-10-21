@@ -343,6 +343,41 @@ fn test_transfer_rejected_before_round_filled() {
     assert_eq!(result, Err(Ok(PoolError::InvoiceNotFound)));
 }
 
+/// #914: a self-transfer must be rejected. Before the guard it wrote back the inflated
+/// sum (from + moved bps) into the one slot both legs shared.
+#[test]
+fn test_transfer_to_self_is_rejected_and_keeps_share() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id) = setup(&env);
+    let sme = Address::generate(&env);
+    let investors = seed_investors(&env, &client, &usdc_id, 1, 100_000);
+
+    let invoice_id = 1u64;
+    let due_date = env.ledger().timestamp() + 1_000_000;
+    let deadline = env.ledger().timestamp() + 10_000;
+    client.open_co_funding(
+        &admin,
+        &default_request(invoice_id, usdc_id.clone(), 10_000, sme, due_date, deadline),
+    );
+    client.commit_to_invoice(&investors[0], &invoice_id, &10_000);
+    client.finalize_co_funding(&admin, &invoice_id);
+
+    let result = client.try_transfer_co_fund_share(
+        &investors[0],
+        &invoice_id,
+        &usdc_id,
+        &investors[0],
+        &5_000,
+    );
+    assert_eq!(result, Err(Ok(PoolError::Unauthorized)));
+    assert_eq!(client.get_co_fund_share(&invoice_id, &investors[0]), 10_000);
+    assert_eq!(
+        client.get_investor_co_fund_positions(&investors[0]).len(),
+        1
+    );
+}
+
 #[test]
 fn test_transfer_after_filled_moves_future_repayment_share() {
     let env = Env::default();

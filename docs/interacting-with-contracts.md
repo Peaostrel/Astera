@@ -160,6 +160,7 @@ The main contract managing pool operations, investor positions, and capital depl
 - `fund_invoice(admin, invoice_id, amount, sme, due_date, token)` — Deploy capital to fund an invoice
 - `repay_invoice(invoice_id, payer, amount)` — Accept a repayment (partial or full) for a funded invoice
 - `estimate_repayment(invoice_id)` — View the current amount owed including accrued interest
+- `estimate_deposit_yield(token, amount, horizon_secs)` — Preview the interest a deposit would earn over a horizon at the current utilization and rate, before calling `deposit`
 - `claim_yield(investor, token)` — Claim accrued yield for an investor's token position
 - `get_token_totals(token)` — Get pool value, deployed amount, and fee totals for a token
 - `get_funded_invoice(invoice_id)` — Retrieve a funded invoice record

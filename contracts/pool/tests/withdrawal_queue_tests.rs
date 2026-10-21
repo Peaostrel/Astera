@@ -284,6 +284,43 @@ fn test_process_withdrawal_queue_prioritizes_aged_requests() {
     assert_eq!(share_balance(&env, &share_token, &bob), 10_000);
 }
 
+/// #912: with no request aged past the threshold and liquidity covering only one of
+/// two requests, the longest-waiting request must be served first. Requests queued at
+/// the same timestamp still share pro-rata, but a younger cohort gets nothing while an
+/// older one is unpaid.
+#[test]
+fn test_process_withdrawal_queue_serves_longest_waiting_first() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id, share_token) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let sme = Address::generate(&env);
+
+    mint(&env, &usdc_id, &alice, 10_000);
+    mint(&env, &usdc_id, &bob, 10_000);
+    mint(&env, &usdc_id, &sme, 20_000);
+    client.deposit(&alice, &usdc_id, &10_000, &None);
+    client.deposit(&bob, &usdc_id, &10_000, &None);
+    let due_date = env.ledger().timestamp() + 86_400;
+    client.fund_invoice(&admin, &1u64, &10_000, &sme, &due_date, &usdc_id);
+    client.fund_invoice(&admin, &2u64, &10_000, &sme, &due_date, &usdc_id);
+
+    // Alice queues first; Bob queues one second later, so they are separate cohorts.
+    client.request_withdrawal(&alice, &usdc_id, &10_000);
+    env.ledger().with_mut(|l| l.timestamp += 1);
+    client.request_withdrawal(&bob, &usdc_id, &10_000);
+
+    // Repaying invoice 2 frees exactly 10,000 of liquidity, enough for one request.
+    client.repay_invoice(&2u64, &sme, &10_000);
+
+    assert_eq!(share_balance(&env, &share_token, &alice), 0);
+    assert_eq!(share_balance(&env, &share_token, &bob), 10_000);
+    let queue = client.get_withdrawal_queue(&usdc_id);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.get(0).unwrap().investor, bob);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
 
