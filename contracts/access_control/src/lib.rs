@@ -572,6 +572,11 @@ impl AccessControlContract {
             .instance()
             .get(&DataKey::RoleConfig(role))
             .ok_or(AccessControlError::RoleNotConfigured)?;
+        // A role with signers but no threshold (e.g. AddSigner before
+        // SetThreshold) would otherwise be treated as 1-of-N below (#1484).
+        if config.threshold == 0 {
+            return Err(AccessControlError::RoleNotConfigured);
+        }
         if !config.signers.contains(&proposer) {
             return Err(AccessControlError::NotASigner);
         }

@@ -250,6 +250,9 @@ pub enum DataKey {
     Paused,
     Config,
     InvoiceContract,
+    /// Optional `access_control` contract whose multisig may act as admin
+    /// (see `require_admin`), so admin actions don't hinge on one key.
+    AccessControl,
     Juror(Address),
     JurorIds,
     JurorCases(Address),
@@ -343,6 +346,29 @@ impl ArbitrationContract {
 
     pub fn get_invoice_contract(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::InvoiceContract)
+    }
+
+    /// Sets the `access_control` contract whose multisig may act as admin.
+    /// Gated by the current admin (the legacy key, or the configured
+    /// `access_control` itself), so the trust anchor can be bootstrapped and
+    /// later rotated through the multisig without a key change.
+    pub fn set_access_control(
+        env: Env,
+        admin: Address,
+        access_control: Address,
+    ) -> Result<(), ArbitrationError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::AccessControl, &access_control);
+        env.events()
+            .publish((EVT, symbol_short!("set_ac")), (admin, access_control));
+        Ok(())
+    }
+
+    pub fn get_access_control(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::AccessControl)
     }
 
     /// Replaces the arbitration parameters wholesale (mirrors
@@ -976,6 +1002,7 @@ impl ArbitrationContract {
         case_id: u64,
         resolution: DisputeResolution,
     ) -> Result<(), ArbitrationError> {
+        require_not_paused(&env);
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         if resolution == DisputeResolution::Pending {
@@ -1197,16 +1224,22 @@ impl ArbitrationContract {
             .is_ok_and(|inner| inner.is_ok())
     }
 
+    /// Accepts the legacy admin key or the configured `access_control`
+    /// contract. Callers must `require_auth` on `admin` first.
     fn require_admin(env: &Env, admin: &Address) -> Result<(), ArbitrationError> {
         let stored: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .ok_or(ArbitrationError::NotInitialized)?;
-        if admin != &stored {
-            return Err(ArbitrationError::Unauthorized);
+        if admin == &stored {
+            return Ok(());
         }
-        Ok(())
+        let access_control: Option<Address> = env.storage().instance().get(&DataKey::AccessControl);
+        if access_control.as_ref() == Some(admin) {
+            return Ok(());
+        }
+        Err(ArbitrationError::Unauthorized)
     }
 
     fn load_config(env: &Env) -> Result<ArbitrationConfig, ArbitrationError> {
