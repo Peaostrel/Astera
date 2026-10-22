@@ -139,8 +139,10 @@ pub enum DataKey {
     PendingScreenerIds,
     FlaggedIds,
     PendingReviewIds,
-    // #927: last request_review timestamp keyed by (caller, target address).
-    ReviewRequestedAt(Address, Address),
+    // #927: last request_review timestamp keyed by target address. Not keyed
+    // by caller: callers are free to generate, so a per-caller cooldown is
+    // trivially bypassed with a fresh address (#1480).
+    ReviewRequestedAt(Address),
     // Screener submission history keyed by screener address.
     ScreenerSubmissions(Address),
     // Last screening timestamp keyed by (screener, subject address).
@@ -592,7 +594,7 @@ impl ComplianceContract {
     /// Permissionless flagging: moves a Cleared address to PendingReview so
     /// privileged actions pause until a screener re-clears them. Callable by
     /// the off-chain monitoring service without screener privileges.
-    /// #927: rate-limited per (caller, address) pair to prevent list spam.
+    /// #927: rate-limited per address (not per caller) to prevent list spam.
     pub fn request_review(
         env: Env,
         caller: Address,
@@ -608,9 +610,9 @@ impl ComplianceContract {
 
         let now = env.ledger().timestamp();
 
-        // #927: enforce cooldown — same caller cannot re-request review for the
-        // same address within REVIEW_REQUEST_COOLDOWN_SECS.
-        let cooldown_key = DataKey::ReviewRequestedAt(caller.clone(), address.clone());
+        // #927: enforce cooldown — review cannot be re-requested for the same
+        // address within REVIEW_REQUEST_COOLDOWN_SECS, regardless of caller.
+        let cooldown_key = DataKey::ReviewRequestedAt(address.clone());
         if let Some(last_at) = env.storage().instance().get::<DataKey, u64>(&cooldown_key) {
             if now < last_at.saturating_add(REVIEW_REQUEST_COOLDOWN_SECS) {
                 return Err(ComplianceError::ReviewRequestTooSoon);
