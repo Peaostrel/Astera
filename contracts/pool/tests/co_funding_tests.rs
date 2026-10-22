@@ -628,3 +628,36 @@ fn test_list_co_funding_rounds_tracks_every_opened_round() {
     assert_eq!(ids.get(0).unwrap(), 1);
     assert_eq!(ids.get(1).unwrap(), 2);
 }
+
+// #906: co-funding must respect the same single-investor concentration cap as deposit.
+#[test]
+fn test_commit_to_invoice_enforces_max_investor_concentration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id) = setup(&env);
+    let sme = Address::generate(&env);
+    seed_investors(&env, &client, &usdc_id, 1, 8_000);
+
+    // Whale holds 2_000 of a 10_000 pool (20%) while the cap is still disabled.
+    let whale = Address::generate(&env);
+    mint(&env, &usdc_id, &whale, 2_000);
+    client.deposit(&whale, &usdc_id, &2_000, &None);
+
+    client.set_max_investor_concentration(&admin, &2_200u32);
+    let due_date = env.ledger().timestamp() + 1_000_000;
+    let deadline = env.ledger().timestamp() + 10_000;
+    client.open_co_funding(
+        &admin,
+        &default_request(1, usdc_id.clone(), 9_000, sme.clone(), due_date, deadline),
+    );
+
+    // Committing 1_000 leaves 9_000 in the pool: 2_000 / 9_000 ≈ 22.2% > 22%.
+    let result = client.try_commit_to_invoice(&whale, &1u64, &1_000);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        PoolError::ConcentrationLimitExceeded.into()
+    );
+
+    // Committing 500 leaves 9_500 in the pool: 2_000 / 9_500 ≈ 21.05% ≤ 22%.
+    client.commit_to_invoice(&whale, &1u64, &500);
+}

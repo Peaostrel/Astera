@@ -670,3 +670,44 @@ fn test_rate_history_ring_buffer_evicts_oldest_on_overflow() {
         );
     }
 }
+
+// #905: the utilization view mirrors the rate ring buffer, timestamps and utilization
+// included, and honours the requested limit.
+#[test]
+fn test_pool_utilization_history_mirrors_rate_samples() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id) = setup(&env);
+
+    let investor = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    mint(&env, &usdc_id, &investor, 100_000);
+    client.deposit(&investor, &usdc_id, &100_000, &None);
+
+    enact_rate_model(&client, &admin, &usdc_id, &env);
+
+    let due_date = env.ledger().timestamp() + 1_000_000;
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.fund_invoice(&admin, &1u64, &10_000i128, &borrower, &due_date, &usdc_id);
+
+    let rate_history = client.get_rate_history(&usdc_id, &100u32);
+    let utilization = client.get_pool_utilization_history(&usdc_id, &100u32);
+    assert_eq!(utilization.len(), rate_history.len());
+    for i in 0..utilization.len() {
+        let u = utilization.get(i).unwrap();
+        let r = rate_history.get(i).unwrap();
+        assert_eq!(u.timestamp, r.timestamp);
+        assert_eq!(u.utilization_bps, r.utilization_bps);
+    }
+    assert_eq!(
+        utilization.get(utilization.len() - 1).unwrap().utilization_bps,
+        1_000
+    );
+
+    assert_eq!(
+        client
+            .get_pool_utilization_history(&usdc_id, &1u32)
+            .len(),
+        1
+    );
+}

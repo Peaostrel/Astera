@@ -366,3 +366,56 @@ proptest! {
         }
     }
 }
+
+// #908: amending a queued withdrawal keeps its queue position and request_id, whereas
+// cancel + re-request would send the investor to the back of the queue.
+#[test]
+fn test_adjust_withdrawal_request_keeps_queue_position() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, usdc_id, _share_token) = setup(&env);
+    let pool_id = client.address.clone();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let sme = Address::generate(&env);
+
+    mint(&env, &usdc_id, &alice, 10_000);
+    mint(&env, &usdc_id, &bob, 10_000);
+    mint(&env, &usdc_id, &sme, 20_000);
+    client.deposit(&alice, &usdc_id, &10_000, &None);
+    client.deposit(&bob, &usdc_id, &10_000, &None);
+    client.fund_invoice(
+        &admin,
+        &1u64,
+        &20_000,
+        &sme,
+        &(env.ledger().timestamp() + 86_400),
+        &usdc_id,
+    );
+
+    client.request_withdrawal(&alice, &usdc_id, &5_000);
+    client.request_withdrawal(&bob, &usdc_id, &3_000);
+    let before = client.get_withdrawal_queue(&usdc_id).get(0).unwrap();
+    assert_eq!(before.investor, alice);
+
+    // Growing Alice's request draws the extra 3_000 from her 5_000 available.
+    client.adjust_withdrawal_request(&alice, &usdc_id, &8_000);
+    let queue = client.get_withdrawal_queue(&usdc_id);
+    assert_eq!(queue.len(), 2);
+    let after = queue.get(0).unwrap();
+    assert_eq!(after.investor, alice);
+    assert_eq!(after.request_id, before.request_id);
+    assert_eq!(after.shares, 8_000);
+    assert_eq!(available_of(&env, &pool_id, &alice, &usdc_id), 2_000);
+
+    // Shrinking returns the difference to available.
+    client.adjust_withdrawal_request(&alice, &usdc_id, &1_000);
+    assert_eq!(available_of(&env, &pool_id, &alice, &usdc_id), 9_000);
+
+    // Growing beyond what is still available is rejected.
+    let result = client.try_adjust_withdrawal_request(&alice, &usdc_id, &10_001);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        PoolError::WithdrawalExceedsLimit.into()
+    );
+}

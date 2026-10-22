@@ -297,6 +297,15 @@ pub struct RateSnapshot {
     pub rate_bps: u32,
 }
 
+// #905: utilization-only projection of a `RateSnapshot`, returned by
+// `get_pool_utilization_history` so tuning tools don't have to ignore the rate.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UtilizationSnapshot {
+    pub timestamp: u64,
+    pub utilization_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub struct RateModelProposal {
@@ -2680,6 +2689,69 @@ impl FundingPool {
         })
     }
 
+    // #908: resize a queued withdrawal in place. Cancelling and re-requesting sends
+    // the investor to the back of the queue, so amending keeps `request_id` and the
+    // investor's queue position stable and `estimate_withdrawal_wait` accurate.
+    pub fn adjust_withdrawal_request(
+        env: Env,
+        investor: Address,
+        token: Address,
+        new_shares: i128,
+    ) -> Result<(), PoolError> {
+        investor.require_auth();
+        bump_instance(&env);
+        if new_shares <= 0 {
+            return Err(PoolError::ZeroAmount);
+        }
+
+        let queue_key = DataKey::WithdrawalQueue(token.clone());
+        let mut queue: Vec<WithdrawalRequest> = env
+            .storage()
+            .persistent()
+            .get(&queue_key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut found: Option<u32> = None;
+        for idx in 0..queue.len() {
+            if let Some(req) = queue.get(idx) {
+                if req.investor == investor {
+                    found = Some(idx);
+                    break;
+                }
+            }
+        }
+        let idx = found.ok_or(PoolError::WithdrawalRequestNotFound)?;
+        let mut request = queue.get(idx).ok_or(PoolError::WithdrawalRequestNotFound)?;
+
+        // Shares are held out of `available` while queued, so growing the request
+        // must draw from it and shrinking must return the difference.
+        let delta = new_shares - request.shares;
+        let pos_key = DataKey::InvestorPosition(investor.clone(), token.clone());
+        let position: InvestorPosition = env
+            .storage()
+            .persistent()
+            .get(&pos_key)
+            .unwrap_or_default();
+        if delta > 0 && position.available < delta {
+            return Err(PoolError::WithdrawalExceedsLimit);
+        }
+        update_investor_available(&env, &investor, &token, -delta)?;
+
+        request.shares = new_shares;
+        queue.set(idx, request.clone());
+        env.storage().persistent().set(&queue_key, &queue);
+        env.storage().persistent().set(
+            &DataKey::WithdrawalRequest(investor.clone(), request.request_id),
+            &request,
+        );
+
+        env.events().publish(
+            (EVT, symbol_short!("wd_amnd")),
+            (investor, token, new_shares, request.request_id),
+        );
+        Ok(())
+    }
+
     pub fn get_withdrawal_queue(env: Env, token: Address) -> Vec<WithdrawalRequest> {
         bump_instance(&env);
         let queue_key = DataKey::WithdrawalQueue(token);
@@ -4294,6 +4366,24 @@ impl FundingPool {
         out
     }
 
+    // #905: oldest-first window of the newest `limit` utilization samples for `token`.
+    // Samples share the rate-snapshot ring buffer, so they are only recorded for
+    // tokens with a rate model configured (see `record_rate_snapshot`).
+    pub fn get_pool_utilization_history(
+        env: Env,
+        token: Address,
+        limit: u32,
+    ) -> Vec<UtilizationSnapshot> {
+        let mut out = Vec::new(&env);
+        for sample in Self::get_rate_history(env.clone(), token, limit).iter() {
+            out.push_back(UtilizationSnapshot {
+                timestamp: sample.timestamp,
+                utilization_bps: sample.utilization_bps,
+            });
+        }
+        out
+    }
+
     pub fn preview_rate_at_utilization(
         env: Env,
         token: Address,
@@ -5895,6 +5985,24 @@ impl FundingPool {
                 .unwrap_or_default();
             if position.available < shares_to_burn {
                 return Err(PoolError::InvalidAmount);
+            }
+
+            // #906: committing moves `usdc_equiv` out of the live pool value, so the
+            // investor's share of what remains must respect the same cap that
+            // `deposit` enforces. Without this, co-funding bypasses the limit.
+            let config = get_config_cached(&env)?;
+            if config.max_single_investor_bps < BPS_DENOM {
+                let post_pool_value = tt
+                    .pool_value
+                    .checked_sub(usdc_equiv)
+                    .ok_or(PoolError::AmountOverflow)?;
+                if post_pool_value > 0 {
+                    let investor_share_bps = ((position.deposited as u128 * BPS_DENOM as u128)
+                        / post_pool_value as u128) as u32;
+                    if investor_share_bps > config.max_single_investor_bps {
+                        return Err(PoolError::ConcentrationLimitExceeded);
+                    }
+                }
             }
 
             let cofund_key = DataKey::CoFundShare(invoice_id, investor.clone());
@@ -8344,6 +8452,22 @@ mod test {
         // Treasury's real token balance increased by exactly the fee withdrawn.
         assert_eq!(token_client.balance(&treasury), expected_fee);
         assert_eq!(client.get_protocol_revenue(&usdc_id), 0);
+
+        // #907: the withdrawal publishes `rev_wdraw` (token, amount, treasury) so
+        // indexers can reconcile treasury payouts from events alone.
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (EVT, symbol_short!("rev_wdraw")).into_val(&env);
+        let event = env
+            .events()
+            .all()
+            .iter()
+            .find(|e| e.1 == expected_topics)
+            .expect("rev_wdraw event not emitted");
+        let (event_token, event_amount, event_treasury): (Address, i128, Address) =
+            event.2.into_val(&env);
+        assert_eq!(event_token, usdc_id);
+        assert_eq!(event_amount, expected_fee);
+        assert_eq!(event_treasury, treasury);
     }
 
     // ── #773: loyalty bonus APY for long-term depositors ─────────────────────
